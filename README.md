@@ -36,3 +36,7 @@ plugins/supateam/
 
 `scripts/supateam-cli.mjs` はモノレポ `packages/cli` からビルドした生成物です。手で編集せず、
 モノレポ側で `pnpm --filter @supateam/cli run build` → `sync:plugin` で更新してください。
+
+## License
+
+Apache-2.0. See `LICENSE`.
