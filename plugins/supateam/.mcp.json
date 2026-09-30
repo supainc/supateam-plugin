@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "supateam": {
+      "type": "http",
+      "url": "https://api.supateam.com/public/v1/mcp",
+      "headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs\" mcp-headers"
+    }
+  }
+}
