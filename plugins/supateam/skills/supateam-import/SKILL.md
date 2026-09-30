@@ -23,6 +23,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" whoami --json
 
 - 「not logged in」「expired」で失敗したら `login` を実行する。ブラウザが開くので、supateam にログインした状態で「許可する」を押すようユーザーに伝える。完了まで待つ (最大 10 分)。
 - ローカル開発や別環境に接続する場合だけ `--api-url` / `--app-url` を付ける。
+- SSH 先などブラウザと CLI が別マシンの場合は `login --manual`。表示される URL をユーザーが手元のブラウザで開き、「許可」後に表示されるコードをプロンプトに貼り付けてもらう。
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" login
@@ -75,3 +76,4 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" import --source all --yes
 - CLI の出力に含まれるメールアドレス以外の個人情報を勝手に要約に足さない。
 - 失敗時は CLI の stderr をそのまま示し、`login` のやり直しか管理者への依頼のどちらかを案内する。
 - 詳細ガイド: https://app.supateam.com/docs/local-history-import-guide
+- supateam MCP (プラグイン同梱) を CLI トークンで使えるのはオーナー / 管理者のみ。member ロールでは 403 になるので、その場合は履歴インポートだけを案内する。
