@@ -1113,7 +1113,7 @@ async function runLinkMember(args, env = process.env) {
 var IMPORT_EVENT_DATE_HEADER = "X-Supateam-Import-Event-Date";
 var MAX_POST_BYTES = 85e3;
 var MAX_COMPLETE_RANGE_DAYS = 89;
-var DEFAULT_SINCE_DAYS = 400;
+var DEFAULT_SINCE_DAYS = 398;
 var SOURCES = ["claude-code", "codex"];
 function parseImportOptions(args, now = Date.now()) {
   const sourceFlag = flagString(args.flags, "source") ?? "all";
@@ -1132,6 +1132,7 @@ function parseImportOptions(args, now = Date.now()) {
     sinceMs,
     untilMs,
     untilExplicit: untilFlag !== null && untilFlag !== void 0,
+    allowOtelOverlap: flagBool(args.flags, "allow-otel-overlap"),
     dryRun: flagBool(args.flags, "dry-run"),
     json: flagBool(args.flags, "json"),
     yes: flagBool(args.flags, "yes"),
@@ -1204,22 +1205,30 @@ function groupByUtcDate(sessions) {
   return [...byDate.entries()].sort(([a], [b]) => a < b ? -1 : 1);
 }
 function splitIntoPayloads(batches, maxBytes = MAX_POST_BYTES) {
-  const payloads = [];
+  const chunks = [];
   let current = [];
+  let currentIncluded = [];
   let currentBytes = 0;
   const flush = () => {
-    if (current.length > 0) payloads.push({ resourceLogs: current });
+    if (current.length > 0)
+      chunks.push({
+        payload: { resourceLogs: current },
+        included: currentIncluded
+      });
     current = [];
+    currentIncluded = [];
     currentBytes = 0;
   };
   for (const { session, events } of batches) {
     const resourceBytes = JSON.stringify(session.resource).length + 80;
     let entry = null;
+    let included = null;
     for (const e of events) {
       const bytes = JSON.stringify(e.record).length + 1;
       if (entry && currentBytes + bytes > maxBytes) {
         flush();
         entry = null;
+        included = null;
       }
       if (!entry) {
         entry = {
@@ -1227,14 +1236,17 @@ function splitIntoPayloads(batches, maxBytes = MAX_POST_BYTES) {
           scopeLogs: [{ scope: { name: SCOPE_NAME }, logRecords: [] }]
         };
         current.push(entry);
+        included = { session, events: [] };
+        currentIncluded.push(included);
         currentBytes += resourceBytes;
       }
       entry.scopeLogs[0].logRecords.push(e.record);
+      included?.events.push(e);
       currentBytes += bytes;
     }
   }
   flush();
-  return payloads;
+  return chunks;
 }
 function splitDateRange(startDate, endDate) {
   const ranges = [];
@@ -1292,17 +1304,17 @@ async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
   const grouped = groupByUtcDate(sessions);
   let posts = 0;
   for (const [date, batches] of grouped) {
-    const payloads = splitIntoPayloads(batches);
-    for (const payload of payloads) {
+    const chunks = splitIntoPayloads(batches);
+    for (const { payload, included } of chunks) {
       await sender.postLogs(source, date, payload);
       posts++;
+      for (const { session, events } of included) {
+        advanceLedger(ledger, source, session.sessionId, events);
+      }
+      saveLedger(ledger, env);
     }
-    for (const { session, events } of batches) {
-      advanceLedger(ledger, source, session.sessionId, events);
-    }
-    saveLedger(ledger, env);
     log(
-      `  ${source} ${date}: ${batches.length} sessions, ${payloads.length} request(s)`
+      `  ${source} ${date}: ${batches.length} sessions, ${chunks.length} request(s)`
     );
   }
   const startDate = grouped[0][0];
@@ -1336,7 +1348,7 @@ async function runImport(args, env = process.env) {
     const result = source === "claude-code" ? await convertClaudeCode(convertOptions, { env, priceTable }) : await convertCodex(convertOptions, { env });
     prepared.push(prepareSource(source, result, ledger, options.untilMs));
   }
-  const creds = options.dryRun ? null : requireCredentials(env);
+  const creds = options.dryRun ? loadCredentials(env) : requireCredentials(env);
   const summaries = prepared.map((p) => p.summary);
   let otelWarning = null;
   if (creds) {
@@ -1370,6 +1382,11 @@ async function runImport(args, env = process.env) {
 ${otelWarning}
 `);
   if (options.dryRun || !creds) return { sent: false, summaries };
+  if (otelWarning && !options.allowOtelOverlap) {
+    throw new Error(
+      "OTel \u9023\u643A\u3068\u91CD\u306A\u308B\u671F\u9593\u304C\u3042\u308B\u305F\u3081\u9001\u4FE1\u3092\u4E2D\u6B62\u3057\u307E\u3057\u305F\u3002--until \u3067\u671F\u9593\u3092\u5207\u308B\u304B\u3001\u4E8C\u91CD\u8A08\u4E0A\u3092\u627F\u77E5\u306E\u4E0A\u3067 --allow-otel-overlap \u3092\u6307\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044"
+    );
+  }
   const total = prepared.reduce((n, p) => n + p.summary.events, 0);
   if (total === 0) {
     console.log(
@@ -1536,7 +1553,7 @@ var USAGE = `supateam ${VERSION} \u2014 Claude Code / Codex \u306E\u30ED\u30FC\u
   supateam link-member (--member-id <uuid> | --create <\u540D\u524D>) [--emails a,b] [--json]
       \u81EA\u5206\u306E\u8A08\u6E2C\u5BFE\u8C61\u30E1\u30F3\u30D0\u30FC\u3092\u65E2\u5B58\u304B\u3089\u9078\u3076\u3001\u307E\u305F\u306F\u65B0\u898F\u4F5C\u6210\u3057\u3066\u7D10\u3065\u3051\u308B
   supateam import [--source claude-code|codex|all] [--since YYYY-MM-DD] [--until YYYY-MM-DD]
-                  [--dry-run] [--json] [--yes] [--email <addr>]
+                  [--dry-run] [--json] [--yes] [--email <addr>] [--allow-otel-overlap]
       \u30ED\u30FC\u30AB\u30EB\u306E\u30BB\u30C3\u30B7\u30E7\u30F3\u5C65\u6B74\u3092 OTel \u5F62\u5F0F\u306B\u5909\u63DB\u3057\u3066\u9001\u4FE1\u3059\u308B\u3002\u9001\u4FE1\u524D\u306B\u5FC5\u305A\u5185\u5BB9\u306E\u8981\u7D04\u3092\u8868\u793A\u3059\u308B
   supateam mcp-headers
       Claude Code \u306E MCP headersHelper \u7528\u306B Authorization \u30D8\u30C3\u30C0\u3092 JSON \u3067\u51FA\u529B\u3059\u308B
