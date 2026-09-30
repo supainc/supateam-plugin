@@ -49,6 +49,7 @@ function parseDateFlag(flags, key, endOfDay = false) {
 }
 
 // src/commands/import.ts
+import { randomUUID } from "crypto";
 import { createInterface as createInterface2 } from "readline";
 
 // src/claude-prices.ts
@@ -370,7 +371,12 @@ var bearer = (token) => ({ Authorization: `Bearer ${token}` });
 // src/ledger.ts
 import { mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "fs";
 import { dirname as dirname2 } from "path";
-var emptyLedger = () => ({ "claude-code": {}, codex: {} });
+var SOURCES = ["claude-code", "codex"];
+var emptyLedger = () => ({
+  "claude-code": {},
+  codex: {},
+  pendingComplete: { "claude-code": [], codex: [] }
+});
 function loadLedger(env = process.env) {
   let raw;
   try {
@@ -386,16 +392,26 @@ function loadLedger(env = process.env) {
   }
   const ledger = emptyLedger();
   if (!isObject(parsed)) return ledger;
-  for (const source of ["claude-code", "codex"]) {
+  for (const source of SOURCES) {
     const sessions = asObject(parsed[source]);
-    if (!sessions) continue;
-    for (const [sessionId, entry] of Object.entries(sessions)) {
-      const o = asObject(entry);
-      const lastRecordUuid = asString(o?.lastRecordUuid);
-      const lastTimestamp = asNumber(o?.lastTimestamp);
-      if (lastRecordUuid !== null && lastTimestamp !== null) {
-        ledger[source][sessionId] = { lastRecordUuid, lastTimestamp };
+    if (sessions) {
+      for (const [sessionId, entry] of Object.entries(sessions)) {
+        const o = asObject(entry);
+        const lastTimestamp = asNumber(o?.lastTimestamp);
+        if (lastTimestamp === null) continue;
+        const ids = (asArray(o?.lastRecordIds) ?? []).map((v) => asString(v)).filter((v) => v !== null);
+        const legacy = asString(o?.lastRecordUuid);
+        if (ids.length === 0 && legacy) ids.push(legacy);
+        ledger[source][sessionId] = { lastTimestamp, lastRecordIds: ids };
       }
+    }
+    const pending = asArray(asObject(parsed.pendingComplete)?.[source]) ?? [];
+    for (const item of pending) {
+      const o = asObject(item);
+      const startDate = asString(o?.startDate);
+      const endDate = asString(o?.endDate);
+      if (startDate && endDate)
+        ledger.pendingComplete[source].push({ startDate, endDate });
     }
   }
   return ledger;
@@ -409,18 +425,40 @@ function saveLedger(ledger, env = process.env) {
 function filterUnsent(ledger, source, sessionId, events) {
   const entry = ledger[source][sessionId];
   if (!entry) return events;
-  return events.filter((e) => e.timestampMs > entry.lastTimestamp);
+  const sentAtLast = new Set(entry.lastRecordIds);
+  return events.filter(
+    (e) => e.timestampMs > entry.lastTimestamp || e.timestampMs === entry.lastTimestamp && !sentAtLast.has(e.recordId)
+  );
 }
 function advanceLedger(ledger, source, sessionId, sent) {
   if (sent.length === 0) return;
-  let latest = sent[0];
-  for (const e of sent) if (e.timestampMs > latest.timestampMs) latest = e;
+  let latestMs = sent[0].timestampMs;
+  for (const e of sent) if (e.timestampMs > latestMs) latestMs = e.timestampMs;
+  const idsAtLatest = sent.filter((e) => e.timestampMs === latestMs).map((e) => e.recordId);
   const current = ledger[source][sessionId];
-  if (current && current.lastTimestamp >= latest.timestampMs) return;
+  if (current && current.lastTimestamp > latestMs) return;
+  if (current && current.lastTimestamp === latestMs) {
+    current.lastRecordIds = [
+      .../* @__PURE__ */ new Set([...current.lastRecordIds, ...idsAtLatest])
+    ];
+    return;
+  }
   ledger[source][sessionId] = {
-    lastRecordUuid: latest.recordId,
-    lastTimestamp: latest.timestampMs
+    lastTimestamp: latestMs,
+    lastRecordIds: [...new Set(idsAtLatest)]
   };
+}
+function addPendingComplete(ledger, source, range) {
+  const list = ledger.pendingComplete[source];
+  if (!list.some(
+    (r) => r.startDate === range.startDate && r.endDate === range.endDate
+  ))
+    list.push(range);
+}
+function removePendingComplete(ledger, source, range) {
+  ledger.pendingComplete[source] = ledger.pendingComplete[source].filter(
+    (r) => !(r.startDate === range.startDate && r.endDate === range.endDate)
+  );
 }
 
 // src/otlp.ts
@@ -495,6 +533,7 @@ var newAccumulator = (sessionId) => ({
   sessionId,
   version: null,
   events: [],
+  endMs: 0,
   billingEventCount: 0,
   seenMessageIds: /* @__PURE__ */ new Set(),
   seenToolUseIds: /* @__PURE__ */ new Set(),
@@ -582,6 +621,7 @@ async function convertClaudeCode(options, deps = {}) {
       }
       const timestampMs = parseTimestampMs(record.timestamp);
       if (timestampMs === null) continue;
+      if (timestampMs > acc.endMs) acc.endMs = timestampMs;
       if (timestampMs < options.sinceMs || timestampMs > options.untilMs) {
         continue;
       }
@@ -709,6 +749,7 @@ async function convertClaudeCode(options, deps = {}) {
       events: acc.events,
       firstMs: acc.events[0].timestampMs,
       lastMs: acc.events[acc.events.length - 1].timestampMs,
+      endMs: acc.endMs,
       billingEventCount: acc.billingEventCount
     });
   }
@@ -825,6 +866,7 @@ async function convertCodex(options, deps = {}) {
     let lastUserPromptLength = null;
     const events = [];
     let billingEventCount = 0;
+    let endMs = 0;
     for await (const record of readJsonl(file)) {
       const type = asString(record.type);
       const payload = asObject(record.payload) ?? {};
@@ -848,6 +890,7 @@ async function convertCodex(options, deps = {}) {
         continue;
       }
       if (timestampMs === null) continue;
+      if (timestampMs > endMs) endMs = timestampMs;
       if (timestampMs < options.sinceMs || timestampMs > options.untilMs) {
         continue;
       }
@@ -948,6 +991,7 @@ async function convertCodex(options, deps = {}) {
       events,
       firstMs: events[0].timestampMs,
       lastMs: events[events.length - 1].timestampMs,
+      endMs,
       billingEventCount
     });
   }
@@ -1080,7 +1124,9 @@ async function runWhoami(args, env = process.env) {
   }
   console.log(`members (${me.members.length}):`);
   for (const m of me.members) {
-    console.log(`  ${m.id}  ${m.name}  ${m.workEmails.join(", ")}`);
+    console.log(
+      `  ${m.id}  ${m.name}${m.hasWorkEmails ? "" : "  (\u696D\u52D9\u30E1\u30FC\u30EB\u672A\u767B\u9332)"}`
+    );
   }
 }
 async function runLinkMember(args, env = process.env) {
@@ -1114,10 +1160,10 @@ var IMPORT_EVENT_DATE_HEADER = "X-Supateam-Import-Event-Date";
 var MAX_POST_BYTES = 85e3;
 var MAX_COMPLETE_RANGE_DAYS = 89;
 var DEFAULT_SINCE_DAYS = 398;
-var SOURCES = ["claude-code", "codex"];
+var SOURCES2 = ["claude-code", "codex"];
 function parseImportOptions(args, now = Date.now()) {
   const sourceFlag = flagString(args.flags, "source") ?? "all";
-  const sources = sourceFlag === "all" ? SOURCES : sourceFlag === "claude-code" || sourceFlag === "codex" ? [sourceFlag] : (() => {
+  const sources = sourceFlag === "all" ? SOURCES2 : sourceFlag === "claude-code" || sourceFlag === "codex" ? [sourceFlag] : (() => {
     throw new Error(
       "--source \u306F claude-code | codex | all \u306E\u3044\u305A\u308C\u304B\u3067\u3059"
     );
@@ -1156,7 +1202,7 @@ function prepareSource(source, result, ledger, untilMs) {
   let skipped = 0;
   const sessions = [];
   for (const s of result.sessions) {
-    if (s.lastMs > untilMs) {
+    if (s.endMs > untilMs) {
       skipped++;
       continue;
     }
@@ -1204,6 +1250,7 @@ function groupByUtcDate(sessions) {
   }
   return [...byDate.entries()].sort(([a], [b]) => a < b ? -1 : 1);
 }
+var IMPORT_BATCH_ID_HEADER = "X-Supateam-Import-Batch-Id";
 function splitIntoPayloads(batches, maxBytes = MAX_POST_BYTES) {
   const chunks = [];
   let current = [];
@@ -1213,7 +1260,8 @@ function splitIntoPayloads(batches, maxBytes = MAX_POST_BYTES) {
     if (current.length > 0)
       chunks.push({
         payload: { resourceLogs: current },
-        included: currentIncluded
+        included: currentIncluded,
+        batchId: randomUUID()
       });
     current = [];
     currentIncluded = [];
@@ -1271,7 +1319,7 @@ async function confirm(question) {
   return /^y(es)?$/i.test(answer.trim());
 }
 var httpSender = (creds) => ({
-  postLogs: async (source, eventDate, payload) => {
+  postLogs: async (source, eventDate, batchId, payload) => {
     const res = await requestWithRetry(
       `${creds.apiUrl}/public/v1/otel/${source}/v1/logs`,
       {
@@ -1279,6 +1327,7 @@ var httpSender = (creds) => ({
         headers: {
           "Content-Type": "application/json",
           [IMPORT_EVENT_DATE_HEADER]: eventDate,
+          [IMPORT_BATCH_ID_HEADER]: batchId,
           ...bearer(creds.token)
         },
         body: JSON.stringify(payload)
@@ -1305,8 +1354,8 @@ async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
   let posts = 0;
   for (const [date, batches] of grouped) {
     const chunks = splitIntoPayloads(batches);
-    for (const { payload, included } of chunks) {
-      await sender.postLogs(source, date, payload);
+    for (const { payload, included, batchId } of chunks) {
+      await sender.postLogs(source, date, batchId, payload);
       posts++;
       for (const { session, events } of included) {
         advanceLedger(ledger, source, session.sessionId, events);
@@ -1320,7 +1369,10 @@ async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
   const startDate = grouped[0][0];
   const endDate = grouped[grouped.length - 1][0];
   const eventCount = sessions.reduce((n, s) => n + s.events.length, 0);
-  for (const range of splitDateRange(startDate, endDate)) {
+  const ranges = splitDateRange(startDate, endDate);
+  for (const range of ranges) addPendingComplete(ledger, source, range);
+  saveLedger(ledger, env);
+  for (const range of ranges) {
     await sender.complete({
       source,
       startDate: range.startDate,
@@ -1328,16 +1380,41 @@ async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
       sessionCount: sessions.length,
       eventCount
     });
+    removePendingComplete(ledger, source, range);
+    saveLedger(ledger, env);
     log(
       `  ${source}: \u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})`
     );
   }
   return { dates: grouped.length, posts };
 }
+async function flushPendingCompletes(ledger, sources, sender, log, env = process.env) {
+  let flushed = 0;
+  for (const source of sources) {
+    for (const range of [...ledger.pendingComplete[source]]) {
+      await sender.complete({
+        source,
+        startDate: range.startDate,
+        endDate: range.endDate,
+        sessionCount: 0,
+        eventCount: 0
+      });
+      removePendingComplete(ledger, source, range);
+      saveLedger(ledger, env);
+      flushed++;
+      log(
+        `  ${source}: \u524D\u56DE\u672A\u7533\u544A\u306E\u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})`
+      );
+    }
+  }
+  return flushed;
+}
 async function runImport(args, env = process.env) {
   const options = parseImportOptions(args);
   const ledger = loadLedger(env);
-  const { table: priceTable, overridePath } = loadPriceTable(env);
+  const { table: priceTable, overridePath } = options.sources.includes(
+    "claude-code"
+  ) ? loadPriceTable(env) : { table: {}, overridePath: null };
   const convertOptions = {
     email: options.email,
     sinceMs: options.sinceMs,
@@ -1387,12 +1464,20 @@ ${otelWarning}
       "OTel \u9023\u643A\u3068\u91CD\u306A\u308B\u671F\u9593\u304C\u3042\u308B\u305F\u3081\u9001\u4FE1\u3092\u4E2D\u6B62\u3057\u307E\u3057\u305F\u3002--until \u3067\u671F\u9593\u3092\u5207\u308B\u304B\u3001\u4E8C\u91CD\u8A08\u4E0A\u3092\u627F\u77E5\u306E\u4E0A\u3067 --allow-otel-overlap \u3092\u6307\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044"
     );
   }
+  const sender = httpSender(creds);
+  const flushed = await flushPendingCompletes(
+    ledger,
+    options.sources,
+    sender,
+    console.log,
+    env
+  );
   const total = prepared.reduce((n, p) => n + p.summary.events, 0);
   if (total === 0) {
     console.log(
       "\u9001\u4FE1\u5BFE\u8C61\u306E\u30A4\u30D9\u30F3\u30C8\u306F\u3042\u308A\u307E\u305B\u3093 (\u3059\u3079\u3066\u9001\u4FE1\u6E08\u307F\u304B\u3001\u671F\u9593\u5185\u306B\u30BB\u30C3\u30B7\u30E7\u30F3\u304C\u3042\u308A\u307E\u305B\u3093)"
     );
-    return { sent: false, summaries };
+    return { sent: flushed > 0, summaries };
   }
   if (!options.yes && process.stdin.isTTY) {
     const ok = await confirm("\u4E0A\u8A18\u306E\u5185\u5BB9\u3092 supateam \u306B\u9001\u4FE1\u3057\u307E\u3059\u304B? [y/N] ");
@@ -1401,7 +1486,6 @@ ${otelWarning}
       return { sent: false, summaries };
     }
   }
-  const sender = httpSender(creds);
   for (const p of prepared) {
     const { dates, posts } = await sendPrepared(
       p,
@@ -1424,6 +1508,7 @@ ${otelWarning}
 import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { createServer } from "http";
+import { createInterface as createInterface3 } from "readline";
 var LOGIN_TIMEOUT_MS = 10 * 60 * 1e3;
 var CALLBACK_HTML = (ok, message) => `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><title>supateam CLI</title>
@@ -1489,26 +1574,17 @@ function waitForCallback(state, timeoutMs = LOGIN_TIMEOUT_MS) {
     }
   );
 }
-async function runLogin(args, env = process.env) {
-  const { apiUrl, appUrl } = resolveUrls(
-    {
-      apiUrl: flagString(args.flags, "api-url"),
-      appUrl: flagString(args.flags, "app-url")
-    },
-    env
+async function promptCode() {
+  const rl = createInterface3({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise(
+    (resolve) => rl.question("\u30D6\u30E9\u30A6\u30B6\u306B\u8868\u793A\u3055\u308C\u305F\u8A8D\u53EF\u30B3\u30FC\u30C9\u3092\u8CBC\u308A\u4ED8\u3051\u3066\u304F\u3060\u3055\u3044: ", resolve)
   );
-  const state = randomBytes(24).toString("base64url");
-  const { port, code } = await waitForCallback(state);
-  const authorizeUrl = `${appUrl}/cli/authorize?port=${port}&state=${encodeURIComponent(state)}`;
-  const noBrowser = args.flags.browser === false || flagBool(args.flags, "no-browser");
-  const opened = noBrowser ? false : openBrowser(authorizeUrl);
-  console.log(
-    opened ? `\u30D6\u30E9\u30A6\u30B6\u3067 supateam \u3092\u958B\u304D\u307E\u3057\u305F\u3002\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u304F\u3060\u3055\u3044\u3002
-\u958B\u304B\u306A\u3044\u5834\u5408\u306F\u6B21\u306E URL \u3092\u958B\u3044\u3066\u304F\u3060\u3055\u3044:
-  ${authorizeUrl}` : `\u6B21\u306E URL \u3092\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304D\u3001\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u304F\u3060\u3055\u3044:
-  ${authorizeUrl}`
-  );
-  const authorizationCode = await code;
+  rl.close();
+  const code = answer.trim();
+  if (!code) throw new Error("\u8A8D\u53EF\u30B3\u30FC\u30C9\u304C\u5165\u529B\u3055\u308C\u307E\u305B\u3093\u3067\u3057\u305F");
+  return code;
+}
+async function exchangeAndSave(apiUrl, appUrl, authorizationCode, env) {
   const res = await postJson(
     `${apiUrl}/cli/exchange`,
     { code: authorizationCode },
@@ -1529,6 +1605,35 @@ async function runLogin(args, env = process.env) {
   );
   return creds;
 }
+async function runLogin(args, env = process.env) {
+  const { apiUrl, appUrl } = resolveUrls(
+    {
+      apiUrl: flagString(args.flags, "api-url"),
+      appUrl: flagString(args.flags, "app-url")
+    },
+    env
+  );
+  const state = randomBytes(24).toString("base64url");
+  if (flagBool(args.flags, "manual")) {
+    const authorizeUrl2 = `${appUrl}/cli/authorize?manual=1&state=${encodeURIComponent(state)}`;
+    console.log(
+      `\u6B21\u306E URL \u3092\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304D\u3001\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u8868\u793A\u3055\u308C\u305F\u30B3\u30FC\u30C9\u3092\u8CBC\u308A\u4ED8\u3051\u3066\u304F\u3060\u3055\u3044:
+  ${authorizeUrl2}`
+    );
+    return await exchangeAndSave(apiUrl, appUrl, await promptCode(), env);
+  }
+  const { port, code } = await waitForCallback(state);
+  const authorizeUrl = `${appUrl}/cli/authorize?port=${port}&state=${encodeURIComponent(state)}`;
+  const noBrowser = args.flags.browser === false || flagBool(args.flags, "no-browser");
+  const opened = noBrowser ? false : openBrowser(authorizeUrl);
+  console.log(
+    opened ? `\u30D6\u30E9\u30A6\u30B6\u3067 supateam \u3092\u958B\u304D\u307E\u3057\u305F\u3002\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u304F\u3060\u3055\u3044\u3002
+\u958B\u304B\u306A\u3044\u5834\u5408\u306F\u6B21\u306E URL \u3092\u958B\u3044\u3066\u304F\u3060\u3055\u3044:
+  ${authorizeUrl}` : `\u6B21\u306E URL \u3092\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304D\u3001\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u304F\u3060\u3055\u3044:
+  ${authorizeUrl}`
+  );
+  return await exchangeAndSave(apiUrl, appUrl, await code, env);
+}
 
 // src/commands/mcp-headers.ts
 function runMcpHeaders(env = process.env) {
@@ -1546,7 +1651,7 @@ var VERSION = "0.1.0";
 var USAGE = `supateam ${VERSION} \u2014 Claude Code / Codex \u306E\u30ED\u30FC\u30AB\u30EB\u5C65\u6B74\u3092 supateam \u306B\u53D6\u308A\u8FBC\u3080 (ADR-0022)
 
 \u4F7F\u3044\u65B9:
-  supateam login [--api-url <url>] [--app-url <url>] [--no-browser]
+  supateam login [--api-url <url>] [--app-url <url>] [--no-browser] [--manual]
       \u30D6\u30E9\u30A6\u30B6\u3067 supateam \u306B\u30ED\u30B0\u30A4\u30F3\u3057\u3001\u30E6\u30FC\u30B6\u30FC\u7D10\u3065\u304D\u30C8\u30FC\u30AF\u30F3\u3092 ~/.supateam/credentials.json \u306B\u4FDD\u5B58\u3059\u308B
   supateam whoami [--json]
       \u7D44\u7E54\u30FB\u30E6\u30FC\u30B6\u30FC\u30FB\u30E1\u30F3\u30D0\u30FC\u7D10\u3065\u3051\u306E\u72B6\u614B\u3068\u3001\u5728\u7C4D\u30E1\u30F3\u30D0\u30FC\u4E00\u89A7\u3092\u8868\u793A\u3059\u308B
