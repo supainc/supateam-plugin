@@ -1,0 +1,21 @@
+{
+  "name": "supateam",
+  "owner": {
+    "name": "supa inc.",
+    "url": "https://supateam.com"
+  },
+  "metadata": {
+    "description": "supateam の Claude Code プラグイン: ローカルセッション履歴のインポートと MCP 分析",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "supateam",
+      "source": "./plugins/supateam",
+      "description": "Claude Code / Codex のローカル履歴を supateam に取り込み (/supateam-import)、supateam MCP で AI 利用と開発指標を分析する",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["supateam", "otel", "analytics", "import"]
+    }
+  ]
+}
