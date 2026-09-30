@@ -41,7 +41,9 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" login
 
 ### 3. 送信内容を確認して取り込む
 
-まず dry-run で要約だけ出す。
+まず、この組織で OTel 連携が既に動いているかを確認する。`whoami --json` の `otelKeyCreatedAt` が null でなければ OTel 用キーが発行済みなので、「Claude Code / Codex の OTel 送信を既に設定していますか？ 設定しているなら、いつからですか？」と尋ねる。設定済みなら、その設定日の**前日**を `--until YYYY-MM-DD` に指定して重なる期間を二重計上しないようにする (OTel が届いている期間は OTel を正とする)。未設定なら `--until` は不要。
+
+次に dry-run で要約だけ出す。
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" import --source all --dry-run
