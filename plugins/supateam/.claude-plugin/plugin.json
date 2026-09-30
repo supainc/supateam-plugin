@@ -1,0 +1,11 @@
+{
+  "name": "supateam",
+  "version": "0.1.0",
+  "description": "supateam: ローカルセッション履歴のインポート (/supateam-import) と MCP 分析",
+  "author": {
+    "name": "supa inc.",
+    "url": "https://supateam.com"
+  },
+  "homepage": "https://app.supateam.com/docs/local-history-import-guide",
+  "keywords": ["supateam", "otel", "analytics", "import"]
+}
