@@ -1038,6 +1038,77 @@ function renderSummary(summaries, opts) {
   return lines.join("\n");
 }
 
+// src/commands/whoami.ts
+function collectLocalEmails(env = process.env, loginEmail) {
+  const emails = /* @__PURE__ */ new Set();
+  if (loginEmail) emails.add(loginEmail.toLowerCase());
+  const claude = readClaudeAccount(env).email;
+  if (claude) emails.add(claude.toLowerCase());
+  const codex = readCodexAccount(env).email;
+  if (codex) emails.add(codex.toLowerCase());
+  return [...emails];
+}
+async function fetchMe(env = process.env) {
+  const creds = requireCredentials(env);
+  const emails = collectLocalEmails(env, creds.user.email);
+  const url = `${creds.apiUrl}/public/v1/cli/me?emails=${encodeURIComponent(emails.join(","))}`;
+  const res = await getJson(url, bearer(creds.token));
+  return { creds, me: res.data };
+}
+async function runWhoami(args, env = process.env) {
+  const { creds, me } = await fetchMe(env);
+  if (flagBool(args.flags, "json")) {
+    console.log(JSON.stringify(me, null, 2));
+    return;
+  }
+  console.log(`organization: ${me.organization.name} (${me.organization.id})`);
+  console.log(
+    `user: ${me.user.email}${me.user.name ? ` (${me.user.name})` : ""} role=${me.user.role ?? "-"} token expires ${creds.expiresAt}`
+  );
+  console.log(`candidate emails: ${me.candidateEmails.join(", ") || "-"}`);
+  console.log(
+    `otel key created at: ${me.otelKeyCreatedAt ?? "- (OTel \u9023\u643A\u306F\u672A\u8A2D\u5B9A)"}`
+  );
+  if (me.match) {
+    console.log(
+      `member: ${me.match.memberName} (${me.match.memberId}) via ${me.match.via}${me.match.email ? ` [${me.match.email}]` : ""}`
+    );
+  } else {
+    console.log(
+      "member: \u672A\u7D10\u3065\u3051\u3002`supateam link-member --member-id <id>` \u304B `--create <\u540D\u524D>` \u3067\u78BA\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044"
+    );
+  }
+  console.log(`members (${me.members.length}):`);
+  for (const m of me.members) {
+    console.log(`  ${m.id}  ${m.name}  ${m.workEmails.join(", ")}`);
+  }
+}
+async function runLinkMember(args, env = process.env) {
+  const creds = requireCredentials(env);
+  const memberId = flagString(args.flags, "member-id");
+  const createName = flagString(args.flags, "create");
+  if ((memberId ? 1 : 0) + (createName ? 1 : 0) !== 1) {
+    throw new Error(
+      "--member-id <uuid> \u304B --create <\u540D\u524D> \u306E\u3069\u3061\u3089\u304B\u4E00\u65B9\u3092\u6307\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044"
+    );
+  }
+  const emailsFlag = flagString(args.flags, "emails");
+  const emails = emailsFlag ? emailsFlag.split(",").map((e) => e.trim()).filter(Boolean) : collectLocalEmails(env, creds.user.email);
+  const body = memberId ? { memberId, emails } : { create: { name: createName }, emails };
+  const res = await postJson(
+    `${creds.apiUrl}/public/v1/cli/member-link`,
+    body,
+    bearer(creds.token)
+  );
+  const m = res.data.member;
+  console.log(
+    `${memberId ? "\u7D10\u3065\u3051\u307E\u3057\u305F" : "\u4F5C\u6210\u3057\u3066\u7D10\u3065\u3051\u307E\u3057\u305F"}: ${m.name} (${m.id}) emails=${m.workEmails.join(", ")}`
+  );
+  if (flagBool(args.flags, "json"))
+    console.log(JSON.stringify(res.data, null, 2));
+  return res.data;
+}
+
 // src/commands/import.ts
 var IMPORT_EVENT_DATE_HEADER = "X-Supateam-Import-Event-Date";
 var MAX_POST_BYTES = 85e3;
@@ -1052,18 +1123,33 @@ function parseImportOptions(args, now = Date.now()) {
     );
   })();
   const sinceMs = parseDateFlag(args.flags, "since") ?? now - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1e3;
-  const untilMs = parseDateFlag(args.flags, "until", true) ?? now;
+  const untilFlag = parseDateFlag(args.flags, "until", true);
+  const untilMs = untilFlag ?? now;
   if (sinceMs > untilMs)
     throw new Error("--since \u306F --until \u4EE5\u524D\u306B\u3057\u3066\u304F\u3060\u3055\u3044");
   return {
     sources,
     sinceMs,
     untilMs,
+    untilExplicit: untilFlag !== null && untilFlag !== void 0,
     dryRun: flagBool(args.flags, "dry-run"),
     json: flagBool(args.flags, "json"),
     yes: flagBool(args.flags, "yes"),
     email: flagString(args.flags, "email") ?? null
   };
+}
+function otelOverlapWarning(prepared, otelKeyCreatedAt, untilExplicit) {
+  if (!otelKeyCreatedAt || untilExplicit) return null;
+  const cutoff = Date.parse(otelKeyCreatedAt);
+  if (Number.isNaN(cutoff)) return null;
+  const overlapping = prepared.reduce(
+    (n, p) => n + p.sessions.filter((s) => s.lastMs >= cutoff).length,
+    0
+  );
+  if (overlapping === 0) return null;
+  const day = new Date(cutoff).toISOString().slice(0, 10);
+  const before = new Date(cutoff - 864e5).toISOString().slice(0, 10);
+  return `\u26A0 \u3053\u306E\u7D44\u7E54\u3067\u306F ${day} \u306B OTel \u7528\u30AD\u30FC\u304C\u767A\u884C\u3055\u308C\u3066\u3044\u307E\u3059\u3002OTel \u9023\u643A\u3092\u65E2\u306B\u8A2D\u5B9A\u3057\u3066\u3044\u308B\u5834\u5408\u3001\u305D\u308C\u4EE5\u964D\u306E\u30BB\u30C3\u30B7\u30E7\u30F3 (${overlapping} \u4EF6) \u306F OTel \u3067\u53D7\u4FE1\u6E08\u307F\u306E\u53EF\u80FD\u6027\u304C\u3042\u308A\u4E8C\u91CD\u8A08\u4E0A\u306B\u306A\u308A\u307E\u3059\u3002\u8A2D\u5B9A\u65E5\u306E\u524D\u65E5\u3092 --until \u3067\u6307\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044 (\u4F8B: --until ${before})\u3002\u672A\u8A2D\u5B9A\u306A\u3089\u3001\u3053\u306E\u307E\u307E\u9001\u4FE1\u3057\u3066\u554F\u984C\u3042\u308A\u307E\u305B\u3093`;
 }
 function prepareSource(source, result, ledger, untilMs) {
   let skipped = 0;
@@ -1252,9 +1338,22 @@ async function runImport(args, env = process.env) {
   }
   const creds = options.dryRun ? null : requireCredentials(env);
   const summaries = prepared.map((p) => p.summary);
+  let otelWarning = null;
+  if (creds) {
+    const { me } = await fetchMe(env);
+    otelWarning = otelOverlapWarning(
+      prepared,
+      me.otelKeyCreatedAt,
+      options.untilExplicit
+    );
+  }
   if (options.json) {
     console.log(
-      JSON.stringify({ dryRun: options.dryRun, sources: summaries }, null, 2)
+      JSON.stringify(
+        { dryRun: options.dryRun, sources: summaries, otelWarning },
+        null,
+        2
+      )
     );
   } else {
     console.log(
@@ -1267,6 +1366,9 @@ async function runImport(args, env = process.env) {
       })
     );
   }
+  if (otelWarning && !options.json) console.log(`
+${otelWarning}
+`);
   if (options.dryRun || !creds) return { sent: false, summaries };
   const total = prepared.reduce((n, p) => n + p.summary.events, 0);
   if (total === 0) {
@@ -1418,74 +1520,6 @@ function runMcpHeaders(env = process.env) {
     `${JSON.stringify({ Authorization: `Bearer ${creds.token}` })}
 `
   );
-}
-
-// src/commands/whoami.ts
-function collectLocalEmails(env = process.env, loginEmail) {
-  const emails = /* @__PURE__ */ new Set();
-  if (loginEmail) emails.add(loginEmail.toLowerCase());
-  const claude = readClaudeAccount(env).email;
-  if (claude) emails.add(claude.toLowerCase());
-  const codex = readCodexAccount(env).email;
-  if (codex) emails.add(codex.toLowerCase());
-  return [...emails];
-}
-async function fetchMe(env = process.env) {
-  const creds = requireCredentials(env);
-  const emails = collectLocalEmails(env, creds.user.email);
-  const url = `${creds.apiUrl}/public/v1/cli/me?emails=${encodeURIComponent(emails.join(","))}`;
-  const res = await getJson(url, bearer(creds.token));
-  return { creds, me: res.data };
-}
-async function runWhoami(args, env = process.env) {
-  const { creds, me } = await fetchMe(env);
-  if (flagBool(args.flags, "json")) {
-    console.log(JSON.stringify(me, null, 2));
-    return;
-  }
-  console.log(`organization: ${me.organization.name} (${me.organization.id})`);
-  console.log(
-    `user: ${me.user.email}${me.user.name ? ` (${me.user.name})` : ""} role=${me.user.role ?? "-"} token expires ${creds.expiresAt}`
-  );
-  console.log(`candidate emails: ${me.candidateEmails.join(", ") || "-"}`);
-  if (me.match) {
-    console.log(
-      `member: ${me.match.memberName} (${me.match.memberId}) via ${me.match.via}${me.match.email ? ` [${me.match.email}]` : ""}`
-    );
-  } else {
-    console.log(
-      "member: \u672A\u7D10\u3065\u3051\u3002`supateam link-member --member-id <id>` \u304B `--create <\u540D\u524D>` \u3067\u78BA\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044"
-    );
-  }
-  console.log(`members (${me.members.length}):`);
-  for (const m of me.members) {
-    console.log(`  ${m.id}  ${m.name}  ${m.workEmails.join(", ")}`);
-  }
-}
-async function runLinkMember(args, env = process.env) {
-  const creds = requireCredentials(env);
-  const memberId = flagString(args.flags, "member-id");
-  const createName = flagString(args.flags, "create");
-  if ((memberId ? 1 : 0) + (createName ? 1 : 0) !== 1) {
-    throw new Error(
-      "--member-id <uuid> \u304B --create <\u540D\u524D> \u306E\u3069\u3061\u3089\u304B\u4E00\u65B9\u3092\u6307\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044"
-    );
-  }
-  const emailsFlag = flagString(args.flags, "emails");
-  const emails = emailsFlag ? emailsFlag.split(",").map((e) => e.trim()).filter(Boolean) : collectLocalEmails(env, creds.user.email);
-  const body = memberId ? { memberId, emails } : { create: { name: createName }, emails };
-  const res = await postJson(
-    `${creds.apiUrl}/public/v1/cli/member-link`,
-    body,
-    bearer(creds.token)
-  );
-  const m = res.data.member;
-  console.log(
-    `${memberId ? "\u7D10\u3065\u3051\u307E\u3057\u305F" : "\u4F5C\u6210\u3057\u3066\u7D10\u3065\u3051\u307E\u3057\u305F"}: ${m.name} (${m.id}) emails=${m.workEmails.join(", ")}`
-  );
-  if (flagBool(args.flags, "json"))
-    console.log(JSON.stringify(res.data, null, 2));
-  return res.data;
 }
 
 // src/version.ts
