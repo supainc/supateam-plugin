@@ -1506,27 +1506,15 @@ ${otelWarning}
 
 // src/commands/login.ts
 import { spawn } from "child_process";
-import { randomBytes } from "crypto";
-import { createServer } from "http";
-import { createInterface as createInterface3 } from "readline";
+import { hostname, platform, release } from "os";
+
+// src/version.ts
+var VERSION = "0.1.0";
+
+// src/commands/login.ts
 var LOGIN_TIMEOUT_MS = 10 * 60 * 1e3;
-var CALLBACK_HTML = (ok, message) => `<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><title>supateam CLI</title>
-<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#2E2E30}
-main{text-align:center}h1{font-size:20px}</style></head>
-<body><main><h1>${ok ? "supateam CLI \u306E\u8A8D\u53EF\u304C\u5B8C\u4E86\u3057\u307E\u3057\u305F" : "\u8A8D\u53EF\u306B\u5931\u6557\u3057\u307E\u3057\u305F"}</h1>
-<p>${message}</p><p>\u3053\u306E\u30A6\u30A3\u30F3\u30C9\u30A6\u306F\u9589\u3058\u3066\u69CB\u3044\u307E\u305B\u3093\u3002</p></main></body></html>`;
-function validateCallback(url, expectedState) {
-  const code = url.searchParams.get("code");
-  const state = url.searchParams.get("state");
-  if (!code) return { ok: false, error: "code \u304C\u3042\u308A\u307E\u305B\u3093" };
-  if (state !== expectedState)
-    return { ok: false, error: "state \u304C\u4E00\u81F4\u3057\u307E\u305B\u3093" };
-  return { ok: true, code };
-}
 function openBrowser(url) {
-  const platform = process.platform;
-  const [cmd, args] = platform === "darwin" ? ["open", [url]] : platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];
+  const [cmd, args] = process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];
   try {
     spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
     return true;
@@ -1534,76 +1522,96 @@ function openBrowser(url) {
     return false;
   }
 }
-function waitForCallback(state, timeoutMs = LOGIN_TIMEOUT_MS) {
-  return new Promise(
-    (resolveStart) => {
-      let resolveCode = () => {
-      };
-      let rejectCode = () => {
-      };
-      const codePromise = new Promise((res, rej) => {
-        resolveCode = res;
-        rejectCode = rej;
-      });
-      const server = createServer((req, res) => {
-        const url = new URL(req.url ?? "/", "http://127.0.0.1");
-        if (url.pathname !== "/callback") {
-          res.writeHead(404).end();
-          return;
-        }
-        const result = validateCallback(url, state);
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        if (result.ok) {
-          res.end(CALLBACK_HTML(true, "\u30BF\u30FC\u30DF\u30CA\u30EB\u306B\u623B\u3063\u3066\u7D9A\u3051\u3066\u304F\u3060\u3055\u3044\u3002"));
-          server.close();
-          resolveCode(result.code);
-        } else {
-          res.end(CALLBACK_HTML(false, result.error));
-        }
-      });
-      const timer = setTimeout(() => {
-        server.close();
-        rejectCode(new Error("\u30D6\u30E9\u30A6\u30B6\u3067\u306E\u8A8D\u53EF\u304C\u30BF\u30A4\u30E0\u30A2\u30A6\u30C8\u3057\u307E\u3057\u305F (10 \u5206)"));
-      }, timeoutMs);
-      codePromise.finally(() => clearTimeout(timer)).catch(() => {
-      });
-      server.listen(0, "127.0.0.1", () => {
-        const { port } = server.address();
-        resolveStart({ port, code: codePromise });
-      });
-    }
-  );
-}
-async function promptCode() {
-  const rl = createInterface3({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise(
-    (resolve) => rl.question("\u30D6\u30E9\u30A6\u30B6\u306B\u8868\u793A\u3055\u308C\u305F\u8A8D\u53EF\u30B3\u30FC\u30C9\u3092\u8CBC\u308A\u4ED8\u3051\u3066\u304F\u3060\u3055\u3044: ", resolve)
-  );
-  rl.close();
-  const code = answer.trim();
-  if (!code) throw new Error("\u8A8D\u53EF\u30B3\u30FC\u30C9\u304C\u5165\u529B\u3055\u308C\u307E\u305B\u3093\u3067\u3057\u305F");
-  return code;
-}
-async function exchangeAndSave(apiUrl, appUrl, authorizationCode, env) {
-  const res = await postJson(
-    `${apiUrl}/cli/exchange`,
-    { code: authorizationCode },
-    {}
-  );
-  const creds = {
-    apiUrl,
-    appUrl,
-    token: res.data.token,
-    expiresAt: res.data.expiresAt,
-    organization: res.data.organization,
-    user: res.data.user
+function clientInfo(env = process.env) {
+  const tool = env.CLAUDE_PLUGIN_ROOT ? "claude-code" : env.CODEX_HOME || env.CODEX_SANDBOX ? "codex" : "cli";
+  return {
+    hostname: hostname(),
+    os: `${platform()} ${release()}`,
+    tool,
+    cliVersion: VERSION
   };
-  const path = saveCredentials(creds, env);
-  console.log(
-    `\u30ED\u30B0\u30A4\u30F3\u3057\u307E\u3057\u305F: ${creds.user.email} @ ${creds.organization.name}
-\u8A8D\u8A3C\u60C5\u5831\u3092\u4FDD\u5B58\u3057\u307E\u3057\u305F: ${path} (\u6709\u52B9\u671F\u9650 ${creds.expiresAt})`
+}
+async function requestDeviceCode(apiUrl, client, fetchImpl = fetch) {
+  const res = await requestWithRetry(
+    `${apiUrl}/cli/device/code`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client })
+    },
+    fetchImpl
   );
-  return creds;
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `\u30ED\u30B0\u30A4\u30F3\u3092\u958B\u59CB\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F (HTTP ${res.status}): ${extractErrorMessage(text)}`
+    );
+  }
+  return JSON.parse(text);
+}
+async function pollDeviceToken(apiUrl, deviceCode, fetchImpl = fetch) {
+  const res = await requestWithRetry(
+    `${apiUrl}/cli/device/token`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceCode })
+    },
+    fetchImpl
+  );
+  const text = await res.text();
+  if (res.ok) {
+    return { status: "approved", data: JSON.parse(text).data };
+  }
+  if (res.status === 400) {
+    let error;
+    try {
+      error = JSON.parse(text).error;
+    } catch {
+      error = void 0;
+    }
+    switch (error) {
+      case "authorization_pending":
+        return { status: "pending" };
+      case "slow_down":
+        return { status: "slow_down" };
+      case "access_denied":
+        return { status: "denied" };
+      case "expired_token":
+        return { status: "expired" };
+    }
+  }
+  throw new Error(
+    `\u30ED\u30B0\u30A4\u30F3\u306E\u78BA\u8A8D\u306B\u5931\u6557\u3057\u307E\u3057\u305F (HTTP ${res.status}): ${extractErrorMessage(text)}`
+  );
+}
+var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitForApproval(apiUrl, device, options = {}) {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const sleepImpl = options.sleepImpl ?? sleep2;
+  const now = options.now ?? Date.now;
+  const deadline = now() + (options.timeoutMs ?? LOGIN_TIMEOUT_MS);
+  let intervalMs = Math.max(1, device.interval) * 1e3;
+  while (now() < deadline) {
+    await sleepImpl(intervalMs);
+    const result = await pollDeviceToken(apiUrl, device.deviceCode, fetchImpl);
+    switch (result.status) {
+      case "approved":
+        return result.data;
+      case "pending":
+        continue;
+      case "slow_down":
+        intervalMs += 5e3;
+        continue;
+      case "denied":
+        throw new Error("\u30D6\u30E9\u30A6\u30B6\u3067\u30ED\u30B0\u30A4\u30F3\u304C\u62D2\u5426\u3055\u308C\u307E\u3057\u305F");
+      case "expired":
+        throw new Error(
+          "\u30B3\u30FC\u30C9\u306E\u6709\u52B9\u671F\u9650 (10 \u5206) \u304C\u5207\u308C\u307E\u3057\u305F\u3002\u3082\u3046\u4E00\u5EA6 login \u3092\u5B9F\u884C\u3057\u3066\u304F\u3060\u3055\u3044"
+        );
+    }
+  }
+  throw new Error("\u30D6\u30E9\u30A6\u30B6\u3067\u306E\u627F\u8A8D\u304C\u30BF\u30A4\u30E0\u30A2\u30A6\u30C8\u3057\u307E\u3057\u305F (10 \u5206)");
 }
 async function runLogin(args, env = process.env) {
   const { apiUrl, appUrl } = resolveUrls(
@@ -1613,26 +1621,34 @@ async function runLogin(args, env = process.env) {
     },
     env
   );
-  const state = randomBytes(24).toString("base64url");
-  if (flagBool(args.flags, "manual")) {
-    const authorizeUrl2 = `${appUrl}/cli/authorize?manual=1&state=${encodeURIComponent(state)}`;
-    console.log(
-      `\u6B21\u306E URL \u3092\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304D\u3001\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u8868\u793A\u3055\u308C\u305F\u30B3\u30FC\u30C9\u3092\u8CBC\u308A\u4ED8\u3051\u3066\u304F\u3060\u3055\u3044:
-  ${authorizeUrl2}`
-    );
-    return await exchangeAndSave(apiUrl, appUrl, await promptCode(), env);
-  }
-  const { port, code } = await waitForCallback(state);
-  const authorizeUrl = `${appUrl}/cli/authorize?port=${port}&state=${encodeURIComponent(state)}`;
+  const device = await requestDeviceCode(apiUrl, clientInfo(env));
+  const verificationUri = `${appUrl}/cli/device?code=${encodeURIComponent(device.userCode)}`;
   const noBrowser = args.flags.browser === false || flagBool(args.flags, "no-browser");
-  const opened = noBrowser ? false : openBrowser(authorizeUrl);
+  const opened = noBrowser ? false : openBrowser(verificationUri);
   console.log(
-    opened ? `\u30D6\u30E9\u30A6\u30B6\u3067 supateam \u3092\u958B\u304D\u307E\u3057\u305F\u3002\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u304F\u3060\u3055\u3044\u3002
-\u958B\u304B\u306A\u3044\u5834\u5408\u306F\u6B21\u306E URL \u3092\u958B\u3044\u3066\u304F\u3060\u3055\u3044:
-  ${authorizeUrl}` : `\u6B21\u306E URL \u3092\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304D\u3001\u300C\u8A31\u53EF\u300D\u3092\u62BC\u3057\u3066\u304F\u3060\u3055\u3044:
-  ${authorizeUrl}`
+    [
+      opened ? "\u30D6\u30E9\u30A6\u30B6\u3067 supateam \u3092\u958B\u304D\u307E\u3057\u305F\u3002" : "\u6B21\u306E URL \u3092\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u3044\u3066\u304F\u3060\u3055\u3044 (\u5225\u306E\u30DE\u30B7\u30F3\u306E\u30D6\u30E9\u30A6\u30B6\u3067\u3082\u69CB\u3044\u307E\u305B\u3093):",
+      `  ${verificationUri}`,
+      "",
+      `\u753B\u9762\u306B\u30B3\u30FC\u30C9 ${device.userCode} \u304C\u8868\u793A\u3055\u308C\u3066\u3044\u308B\u3053\u3068\u3092\u78BA\u8A8D\u3057\u3066\u300C\u8A31\u53EF\u3059\u308B\u300D\u3092\u62BC\u3057\u3066\u304F\u3060\u3055\u3044\u3002`,
+      `(\u6709\u52B9\u671F\u9650 ${Math.round(device.expiresIn / 60)} \u5206)`
+    ].join("\n")
   );
-  return await exchangeAndSave(apiUrl, appUrl, await code, env);
+  const data = await waitForApproval(apiUrl, device);
+  const creds = {
+    apiUrl,
+    appUrl,
+    token: data.token,
+    expiresAt: data.expiresAt,
+    organization: data.organization,
+    user: data.user
+  };
+  const path = saveCredentials(creds, env);
+  console.log(
+    `\u30ED\u30B0\u30A4\u30F3\u3057\u307E\u3057\u305F: ${creds.user.email} @ ${creds.organization.name}
+\u8A8D\u8A3C\u60C5\u5831\u3092\u4FDD\u5B58\u3057\u307E\u3057\u305F: ${path} (\u6709\u52B9\u671F\u9650 ${creds.expiresAt})`
+  );
+  return creds;
 }
 
 // src/commands/mcp-headers.ts
@@ -1644,14 +1660,11 @@ function runMcpHeaders(env = process.env) {
   );
 }
 
-// src/version.ts
-var VERSION = "0.1.0";
-
 // src/cli.ts
 var USAGE = `supateam ${VERSION} \u2014 Claude Code / Codex \u306E\u30ED\u30FC\u30AB\u30EB\u5C65\u6B74\u3092 supateam \u306B\u53D6\u308A\u8FBC\u3080 (ADR-0022)
 
 \u4F7F\u3044\u65B9:
-  supateam login [--api-url <url>] [--app-url <url>] [--no-browser] [--manual]
+  supateam login [--api-url <url>] [--app-url <url>] [--no-browser]
       \u30D6\u30E9\u30A6\u30B6\u3067 supateam \u306B\u30ED\u30B0\u30A4\u30F3\u3057\u3001\u30E6\u30FC\u30B6\u30FC\u7D10\u3065\u304D\u30C8\u30FC\u30AF\u30F3\u3092 ~/.supateam/credentials.json \u306B\u4FDD\u5B58\u3059\u308B
   supateam whoami [--json]
       \u7D44\u7E54\u30FB\u30E6\u30FC\u30B6\u30FC\u30FB\u30E1\u30F3\u30D0\u30FC\u7D10\u3065\u3051\u306E\u72B6\u614B\u3068\u3001\u5728\u7C4D\u30E1\u30F3\u30D0\u30FC\u4E00\u89A7\u3092\u8868\u793A\u3059\u308B
