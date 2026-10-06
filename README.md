@@ -16,7 +16,7 @@ supateam の Claude Code プラグインマーケットプレイスと、ロー�
 ## CLI を直接使う (Codex / ヘッドレス)
 
 ```bash
-npx github:supainc/supateam-plugin login
+npx github:supainc/supateam-plugin login   # URL とコードが表示される。ブラウザで一致を確認して許可
 npx github:supainc/supateam-plugin whoami
 npx github:supainc/supateam-plugin link-member --member-id <id>   # または --create "名前"
 npx github:supainc/supateam-plugin import --source all --dry-run
