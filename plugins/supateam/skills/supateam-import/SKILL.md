@@ -21,9 +21,9 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" <command> [options]
 node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" whoami --json
 ```
 
-- 「not logged in」「expired」で失敗したら `login` を実行する。ブラウザが開くので、supateam にログインした状態で「許可する」を押すようユーザーに伝える。完了まで待つ (最大 10 分)。
+- 「not logged in」「expired」で失敗したら `login` を実行する。CLI が URL と 8 文字のコード (例 `WDJB-MJHT`) を表示してブラウザを開こうとする。ユーザーには「supateam にログインした状態で、画面に表示された端末情報とコードがターミナルと一致することを確認してから『許可する』を押す」よう伝える。CLI は承認されるまでポーリングして待つ (最大 10 分)。
+- ブラウザと CLI が別マシン (SSH 先、devcontainer など) でも同じ手順でよい。表示された URL を手元のブラウザで開いてコードを確認・許可すれば CLI 側が自動で完了する。ブラウザを自動で開かせたくない場合は `--no-browser`。
 - ローカル開発や別環境に接続する場合だけ `--api-url` / `--app-url` を付ける。
-- SSH 先などブラウザと CLI が別マシンの場合は `login --manual`。表示される URL をユーザーが手元のブラウザで開き、「許可」後に表示されるコードをプロンプトに貼り付けてもらう。
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/scripts/supateam-cli.mjs" login
