@@ -65,7 +65,7 @@ var ANTHROPIC_MODEL_PRICES = {
   "claude-fable-5": {
     inputCostPerToken: 1e-5,
     outputCostPerToken: 5e-5,
-    cachedInputCostPerToken: 25e-8
+    cachedInputCostPerToken: 1e-6
   },
   // Mythos は Fable と同じ基盤モデル (承認組織限定) で単価も同一。
   "claude-mythos-5-1": {
@@ -76,7 +76,7 @@ var ANTHROPIC_MODEL_PRICES = {
   "claude-mythos-5": {
     inputCostPerToken: 1e-5,
     outputCostPerToken: 5e-5,
-    cachedInputCostPerToken: 25e-8
+    cachedInputCostPerToken: 1e-6
   },
   "claude-opus-5-5": {
     inputCostPerToken: 4e-6,
@@ -285,7 +285,12 @@ function loadPriceTable(env = process.env) {
         `${PRICE_OVERRIDE_ENV}: ${model} \u306F input/output/cacheWrite/cacheRead (USD per 1M tokens) \u3092\u6301\u3064\u5FC5\u8981\u304C\u3042\u308A\u307E\u3059`
       );
     }
-    table[model] = { input, output, cacheWrite, cacheRead };
+    table[normalizeAnthropicModelId(model)] = {
+      input,
+      output,
+      cacheWrite,
+      cacheRead
+    };
   }
   return { table, overridePath: path };
 }
