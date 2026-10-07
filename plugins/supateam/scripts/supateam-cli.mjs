@@ -55,6 +55,133 @@ import { createInterface as createInterface2 } from "readline";
 // src/claude-prices.ts
 import { readFileSync } from "fs";
 
+// ../shared/dist/ai-model-prices.mjs
+var ANTHROPIC_MODEL_PRICES = {
+  "claude-fable-5-1": {
+    inputCostPerToken: 1e-5,
+    outputCostPerToken: 5e-5,
+    cachedInputCostPerToken: 25e-8
+  },
+  "claude-fable-5": {
+    inputCostPerToken: 1e-5,
+    outputCostPerToken: 5e-5,
+    cachedInputCostPerToken: 25e-8
+  },
+  // Mythos は Fable と同じ基盤モデル (承認組織限定) で単価も同一。
+  "claude-mythos-5-1": {
+    inputCostPerToken: 1e-5,
+    outputCostPerToken: 5e-5,
+    cachedInputCostPerToken: 25e-8
+  },
+  "claude-mythos-5": {
+    inputCostPerToken: 1e-5,
+    outputCostPerToken: 5e-5,
+    cachedInputCostPerToken: 25e-8
+  },
+  "claude-opus-5-5": {
+    inputCostPerToken: 4e-6,
+    outputCostPerToken: 2e-5,
+    cachedInputCostPerToken: 2e-7
+  },
+  "claude-opus-5": {
+    inputCostPerToken: 5e-6,
+    outputCostPerToken: 25e-6,
+    cachedInputCostPerToken: 5e-7
+  },
+  "claude-opus-4-8": {
+    inputCostPerToken: 5e-6,
+    outputCostPerToken: 25e-6,
+    cachedInputCostPerToken: 5e-7
+  },
+  "claude-opus-4-7": {
+    inputCostPerToken: 5e-6,
+    outputCostPerToken: 25e-6,
+    cachedInputCostPerToken: 5e-7
+  },
+  "claude-opus-4-6": {
+    inputCostPerToken: 5e-6,
+    outputCostPerToken: 25e-6,
+    cachedInputCostPerToken: 5e-7
+  },
+  "claude-sonnet-5-5": {
+    inputCostPerToken: 2e-6,
+    outputCostPerToken: 1e-5,
+    cachedInputCostPerToken: 2e-7
+  },
+  "claude-sonnet-5": {
+    inputCostPerToken: 2e-6,
+    outputCostPerToken: 1e-5,
+    cachedInputCostPerToken: 2e-7
+  },
+  "claude-sonnet-4-6": {
+    inputCostPerToken: 3e-6,
+    outputCostPerToken: 15e-6,
+    cachedInputCostPerToken: 3e-7
+  },
+  "claude-haiku-4-5": {
+    inputCostPerToken: 1e-6,
+    outputCostPerToken: 5e-6,
+    cachedInputCostPerToken: 1e-7
+  },
+  "claude-opus-4-5": {
+    inputCostPerToken: 5e-6,
+    outputCostPerToken: 25e-6,
+    cachedInputCostPerToken: 5e-7
+  },
+  "claude-opus-4-1": {
+    inputCostPerToken: 15e-6,
+    outputCostPerToken: 75e-6,
+    cachedInputCostPerToken: 15e-7
+  },
+  "claude-opus-4-0": {
+    inputCostPerToken: 15e-6,
+    outputCostPerToken: 75e-6,
+    cachedInputCostPerToken: 15e-7
+  },
+  "claude-sonnet-4-5": {
+    inputCostPerToken: 3e-6,
+    outputCostPerToken: 15e-6,
+    cachedInputCostPerToken: 3e-7
+  },
+  "claude-sonnet-4-0": {
+    inputCostPerToken: 3e-6,
+    outputCostPerToken: 15e-6,
+    cachedInputCostPerToken: 3e-7
+  },
+  "claude-haiku-3-5": {
+    inputCostPerToken: 8e-7,
+    outputCostPerToken: 4e-6,
+    cachedInputCostPerToken: 8e-8
+  },
+  // Claude Code の履歴インポート (packages/cli) で旧セッションに現れる 3.x 世代。
+  // API 上の ID は claude-3-7-sonnet-YYYYMMDD だが、キーはこのテーブルの
+  // <family>-<major>-<minor> 表記に揃える (normalizeAnthropicModelId が変換する)。
+  "claude-sonnet-3-7": {
+    inputCostPerToken: 3e-6,
+    outputCostPerToken: 15e-6,
+    cachedInputCostPerToken: 3e-7
+  },
+  "claude-sonnet-3-5": {
+    inputCostPerToken: 3e-6,
+    outputCostPerToken: 15e-6,
+    cachedInputCostPerToken: 3e-7
+  }
+};
+function normalizeAnthropicModelId(model) {
+  const bare = model.trim().replace(/\[1m\]$/, "").replace(/-\d{8}$/, "").replace(/-latest$/, "");
+  const legacy = /^claude-(\d+)-(\d+)-(opus|sonnet|haiku)$/.exec(bare);
+  if (legacy) return `claude-${legacy[3]}-${legacy[1]}-${legacy[2]}`;
+  const noMinor = /^claude-(opus|sonnet|haiku)-(\d+)$/.exec(bare);
+  if (noMinor && `${bare}-0` in ANTHROPIC_MODEL_PRICES) return `${bare}-0`;
+  return bare;
+}
+function findAnthropicPriceKey(table, model) {
+  const normalized = normalizeAnthropicModelId(model);
+  if (normalized in table) return normalized;
+  const prefix = Object.keys(table).filter((key) => normalized.startsWith(`${key}-`)).sort((a, b) => b.length - a.length)[0];
+  return prefix ?? null;
+}
+
 // src/jsonl.ts
 import { createReadStream } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -119,69 +246,25 @@ var parseTimestampMs = (v) => {
 };
 
 // src/claude-prices.ts
-var BUNDLED_CLAUDE_PRICES = {
-  "claude-fable-5-1": {
-    input: 10,
-    output: 50,
-    cacheWrite: 12.5,
-    cacheRead: 0.25
-  },
-  "claude-mythos-5-1": {
-    input: 10,
-    output: 50,
-    cacheWrite: 12.5,
-    cacheRead: 0.25
-  },
-  "claude-fable-5": { input: 10, output: 50, cacheWrite: 12.5, cacheRead: 1 },
-  "claude-mythos-5": { input: 10, output: 50, cacheWrite: 12.5, cacheRead: 1 },
-  "claude-opus-5-5": { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 },
-  "claude-opus-5": { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
-  "claude-opus-4-8": { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
-  "claude-opus-4-7": { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
-  "claude-opus-4-6": { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
-  "claude-sonnet-5-5": {
-    input: 2,
-    output: 10,
-    cacheWrite: 2.5,
-    cacheRead: 0.2
-  },
-  "claude-sonnet-5": { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2 },
-  "claude-sonnet-4-6": {
-    input: 3,
-    output: 15,
-    cacheWrite: 3.75,
-    cacheRead: 0.3
-  },
-  "claude-opus-4-5": { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
-  "claude-opus-4-1": {
-    input: 15,
-    output: 75,
-    cacheWrite: 18.75,
-    cacheRead: 1.5
-  },
-  "claude-opus-4": { input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.5 },
-  "claude-sonnet-4-5": {
-    input: 3,
-    output: 15,
-    cacheWrite: 3.75,
-    cacheRead: 0.3
-  },
-  "claude-sonnet-4": { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 },
-  "claude-haiku-4-5": { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
-  "claude-3-7-sonnet": {
-    input: 3,
-    output: 15,
-    cacheWrite: 3.75,
-    cacheRead: 0.3
-  },
-  "claude-3-5-sonnet": {
-    input: 3,
-    output: 15,
-    cacheWrite: 3.75,
-    cacheRead: 0.3
-  },
-  "claude-3-5-haiku": { input: 0.8, output: 4, cacheWrite: 1, cacheRead: 0.08 }
-};
+var CACHE_WRITE_MULTIPLIER = 1.25;
+var PER_MILLION = 1e6;
+var perMillion = (perToken) => Math.round(perToken * PER_MILLION * 1e6) / 1e6;
+var BUNDLED_CLAUDE_PRICES = Object.fromEntries(
+  Object.entries(ANTHROPIC_MODEL_PRICES).map(([model, price]) => {
+    const input = perMillion(price.inputCostPerToken);
+    return [
+      model,
+      {
+        input,
+        output: perMillion(price.outputCostPerToken),
+        cacheWrite: perMillion(
+          price.inputCostPerToken * CACHE_WRITE_MULTIPLIER
+        ),
+        cacheRead: perMillion(price.cachedInputCostPerToken)
+      }
+    ];
+  })
+);
 var PRICE_OVERRIDE_ENV = "SUPATEAM_CLAUDE_PRICES";
 function loadPriceTable(env = process.env) {
   const path = env[PRICE_OVERRIDE_ENV];
@@ -206,18 +289,11 @@ function loadPriceTable(env = process.env) {
   }
   return { table, overridePath: path };
 }
-var normalizeModelId = (model) => model.trim().replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
 function resolvePrice(table, model) {
-  const normalized = normalizeModelId(model);
-  const keys = Object.keys(table).sort((a, b) => b.length - a.length);
-  for (const key of keys) {
-    if (normalized === key || normalized.startsWith(`${key}-`)) {
-      return table[key];
-    }
-  }
-  return null;
+  const key = findAnthropicPriceKey(table, model);
+  return key ? table[key] : null;
 }
-var computeCostUsd = (price, usage) => (usage.input * price.input + usage.output * price.output + usage.cacheWrite * price.cacheWrite + usage.cacheRead * price.cacheRead) / 1e6;
+var computeCostUsd = (price, usage) => (usage.input * price.input + usage.output * price.output + usage.cacheWrite * price.cacheWrite + usage.cacheRead * price.cacheRead) / PER_MILLION;
 
 // src/credentials.ts
 import { mkdirSync, readFileSync as readFileSync2, writeFileSync } from "fs";
