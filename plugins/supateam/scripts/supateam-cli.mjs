@@ -49,7 +49,7 @@ function parseDateFlag(flags, key, endOfDay = false) {
 }
 
 // src/commands/import.ts
-import { randomUUID } from "crypto";
+import { createHash } from "crypto";
 import { createInterface as createInterface2 } from "readline";
 
 // src/claude-prices.ts
@@ -536,9 +536,9 @@ function addPendingComplete(ledger, source, range) {
   ))
     list.push(range);
 }
-function removePendingComplete(ledger, source, range) {
+function removePendingCompleteWithin(ledger, source, range) {
   ledger.pendingComplete[source] = ledger.pendingComplete[source].filter(
-    (r) => !(r.startDate === range.startDate && r.endDate === range.endDate)
+    (r) => !(r.startDate >= range.startDate && r.endDate <= range.endDate)
   );
 }
 
@@ -1220,7 +1220,7 @@ async function runLinkMember(args, env = process.env) {
     );
   }
   const emailsFlag = flagString(args.flags, "emails");
-  const emails = emailsFlag ? emailsFlag.split(",").map((e) => e.trim()).filter(Boolean) : collectLocalEmails(env, creds.user.email);
+  const emails = emailsFlag ? emailsFlag.split(",").map((e) => e.trim()).filter(Boolean) : [creds.user.email];
   const body = memberId ? { memberId, emails } : { create: { name: createName }, emails };
   const res = await postJson(
     `${creds.apiUrl}/public/v1/cli/member-link`,
@@ -1258,7 +1258,6 @@ function parseImportOptions(args, now = Date.now()) {
     sources,
     sinceMs,
     untilMs,
-    untilExplicit: untilFlag !== null && untilFlag !== void 0,
     allowOtelOverlap: flagBool(args.flags, "allow-otel-overlap"),
     dryRun: flagBool(args.flags, "dry-run"),
     json: flagBool(args.flags, "json"),
@@ -1266,8 +1265,8 @@ function parseImportOptions(args, now = Date.now()) {
     email: flagString(args.flags, "email") ?? null
   };
 }
-function otelOverlapWarning(prepared, otelKeyCreatedAt, untilExplicit) {
-  if (!otelKeyCreatedAt || untilExplicit) return null;
+function otelOverlapWarning(prepared, otelKeyCreatedAt) {
+  if (!otelKeyCreatedAt) return null;
   const cutoff = Date.parse(otelKeyCreatedAt);
   if (Number.isNaN(cutoff)) return null;
   const overlapping = prepared.reduce(
@@ -1287,7 +1286,8 @@ function prepareSource(source, result, ledger, untilMs) {
       skipped++;
       continue;
     }
-    const events = filterUnsent(ledger, source, s.sessionId, s.events);
+    const ordered = [...s.events].sort((a, b) => a.timestampMs - b.timestampMs);
+    const events = filterUnsent(ledger, source, s.sessionId, ordered);
     if (events.length === 0) {
       skipped++;
       continue;
@@ -1332,6 +1332,16 @@ function groupByUtcDate(sessions) {
   return [...byDate.entries()].sort(([a], [b]) => a < b ? -1 : 1);
 }
 var IMPORT_BATCH_ID_HEADER = "X-Supateam-Import-Batch-Id";
+function deterministicBatchId(included) {
+  const h = createHash("sha256");
+  for (const { session, events } of included) {
+    h.update(session.sessionId).update("\0");
+    for (const e of events) h.update(e.recordId).update("\n");
+    h.update("\0");
+  }
+  const hex = h.digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 function splitIntoPayloads(batches, maxBytes = MAX_POST_BYTES) {
   const chunks = [];
   let current = [];
@@ -1342,7 +1352,7 @@ function splitIntoPayloads(batches, maxBytes = MAX_POST_BYTES) {
       chunks.push({
         payload: { resourceLogs: current },
         included: currentIncluded,
-        batchId: randomUUID()
+        batchId: deterministicBatchId(currentIncluded)
       });
     current = [];
     currentIncluded = [];
@@ -1391,6 +1401,21 @@ function splitDateRange(startDate, endDate) {
   }
   return ranges;
 }
+function coalesceDateRanges(ranges) {
+  const sorted = [...ranges].sort(
+    (a, b) => a.startDate < b.startDate ? -1 : a.startDate > b.startDate ? 1 : 0
+  );
+  const merged = [];
+  for (const r of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && Date.parse(`${r.startDate}T00:00:00Z`) <= Date.parse(`${last.endDate}T00:00:00Z`) + 864e5) {
+      if (r.endDate > last.endDate) last.endDate = r.endDate;
+    } else {
+      merged.push({ ...r });
+    }
+  }
+  return merged.flatMap((r) => splitDateRange(r.startDate, r.endDate));
+}
 async function confirm(question) {
   const rl = createInterface2({ input: process.stdin, output: process.stdout });
   const answer = await new Promise(
@@ -1421,11 +1446,12 @@ var httpSender = (creds) => ({
     }
   },
   complete: async (body) => {
-    await postJson(
+    const res = await postJson(
       `${creds.apiUrl}/public/v1/cli/import/complete`,
       body,
       bearer(creds.token)
     );
+    return res.data?.workflowInstanceId ?? null;
   }
 });
 async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
@@ -1441,30 +1467,26 @@ async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
       for (const { session, events } of included) {
         advanceLedger(ledger, source, session.sessionId, events);
       }
+      addPendingComplete(ledger, source, { startDate: date, endDate: date });
       saveLedger(ledger, env);
     }
     log(
       `  ${source} ${date}: ${batches.length} sessions, ${chunks.length} request(s)`
     );
   }
-  const startDate = grouped[0][0];
-  const endDate = grouped[grouped.length - 1][0];
   const eventCount = sessions.reduce((n, s) => n + s.events.length, 0);
-  const ranges = splitDateRange(startDate, endDate);
-  for (const range of ranges) addPendingComplete(ledger, source, range);
-  saveLedger(ledger, env);
-  for (const range of ranges) {
-    await sender.complete({
+  for (const range of coalesceDateRanges(ledger.pendingComplete[source])) {
+    const workflowId = await sender.complete({
       source,
       startDate: range.startDate,
       endDate: range.endDate,
       sessionCount: sessions.length,
       eventCount
     });
-    removePendingComplete(ledger, source, range);
+    removePendingCompleteWithin(ledger, source, range);
     saveLedger(ledger, env);
     log(
-      `  ${source}: \u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})`
+      `  ${source}: \u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})${workflowId ? ` workflow=${workflowId}` : ""}`
     );
   }
   return { dates: grouped.length, posts };
@@ -1472,19 +1494,19 @@ async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
 async function flushPendingCompletes(ledger, sources, sender, log, env = process.env) {
   let flushed = 0;
   for (const source of sources) {
-    for (const range of [...ledger.pendingComplete[source]]) {
-      await sender.complete({
+    for (const range of coalesceDateRanges(ledger.pendingComplete[source])) {
+      const workflowId = await sender.complete({
         source,
         startDate: range.startDate,
         endDate: range.endDate,
         sessionCount: 0,
         eventCount: 0
       });
-      removePendingComplete(ledger, source, range);
+      removePendingCompleteWithin(ledger, source, range);
       saveLedger(ledger, env);
       flushed++;
       log(
-        `  ${source}: \u524D\u56DE\u672A\u7533\u544A\u306E\u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})`
+        `  ${source}: \u524D\u56DE\u672A\u7533\u544A\u306E\u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})${workflowId ? ` workflow=${workflowId}` : ""}`
       );
     }
   }
@@ -1511,11 +1533,7 @@ async function runImport(args, env = process.env) {
   let otelWarning = null;
   if (creds) {
     const { me } = await fetchMe(env);
-    otelWarning = otelOverlapWarning(
-      prepared,
-      me.otelKeyCreatedAt,
-      options.untilExplicit
-    );
+    otelWarning = otelOverlapWarning(prepared, me.otelKeyCreatedAt);
   }
   if (options.json) {
     console.log(
