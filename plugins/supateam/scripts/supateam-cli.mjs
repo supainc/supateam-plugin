@@ -456,7 +456,8 @@ var SOURCES = ["claude-code", "codex"];
 var emptyLedger = () => ({
   "claude-code": {},
   codex: {},
-  pendingComplete: { "claude-code": [], codex: [] }
+  pendingComplete: { "claude-code": [], codex: [] },
+  inFlight: { "claude-code": [], codex: [] }
 });
 function loadLedger(env = process.env) {
   let raw;
@@ -494,8 +495,31 @@ function loadLedger(env = process.env) {
       if (startDate && endDate)
         ledger.pendingComplete[source].push({ startDate, endDate });
     }
+    const inFlight = asArray(asObject(parsed.inFlight)?.[source]) ?? [];
+    for (const item of inFlight) {
+      const o = asObject(item);
+      const batchId = asString(o?.batchId);
+      const date = asString(o?.date);
+      if (!batchId || !date) continue;
+      const records = (asArray(o?.records) ?? []).flatMap((r) => {
+        const ro = asObject(r);
+        const sessionId = asString(ro?.sessionId);
+        const recordIds = (asArray(ro?.recordIds) ?? []).map((v) => asString(v)).filter((v) => v !== null);
+        return sessionId ? [{ sessionId, recordIds }] : [];
+      });
+      ledger.inFlight[source].push({ batchId, date, records });
+    }
   }
   return ledger;
+}
+function addInFlight(ledger, source, batch) {
+  if (!ledger.inFlight[source].some((b) => b.batchId === batch.batchId))
+    ledger.inFlight[source].push(batch);
+}
+function removeInFlight(ledger, source, batchId) {
+  ledger.inFlight[source] = ledger.inFlight[source].filter(
+    (b) => b.batchId !== batchId
+  );
 }
 function saveLedger(ledger, env = process.env) {
   const path = ledgerPath(env);
@@ -1414,7 +1438,32 @@ function coalesceDateRanges(ranges) {
       merged.push({ ...r });
     }
   }
-  return merged.flatMap((r) => splitDateRange(r.startDate, r.endDate));
+  return merged.map((r) => ({
+    window: r,
+    parts: splitDateRange(r.startDate, r.endDate)
+  }));
+}
+async function completePendingWindows(ledger, source, counts, sender, log, env, prefix = "") {
+  let completed = 0;
+  for (const { window, parts } of coalesceDateRanges(
+    ledger.pendingComplete[source]
+  )) {
+    for (const range of parts) {
+      const workflowId = await sender.complete({
+        source,
+        startDate: range.startDate,
+        endDate: range.endDate,
+        ...counts
+      });
+      completed++;
+      log(
+        `  ${source}: ${prefix}\u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})${workflowId ? ` workflow=${workflowId}` : ""}`
+      );
+    }
+    removePendingCompleteWithin(ledger, source, window);
+    saveLedger(ledger, env);
+  }
+  return completed;
 }
 async function confirm(question) {
   const rl = createInterface2({ input: process.stdin, output: process.stdout });
@@ -1454,61 +1503,95 @@ var httpSender = (creds) => ({
     return res.data?.workflowInstanceId ?? null;
   }
 });
+var eventKey = (sessionId, recordId) => `${sessionId}\0${recordId}`;
 async function sendPrepared(prepared, ledger, sender, log, env = process.env) {
   const { source, sessions } = prepared;
   if (sessions.length === 0) return { dates: 0, posts: 0 };
-  const grouped = groupByUtcDate(sessions);
   let posts = 0;
+  const postChunk = async (date, batchId, included, payload) => {
+    addInFlight(ledger, source, {
+      batchId,
+      date,
+      records: included.map((b) => ({
+        sessionId: b.session.sessionId,
+        recordIds: b.events.map((e) => e.recordId)
+      }))
+    });
+    saveLedger(ledger, env);
+    await sender.postLogs(source, date, batchId, payload);
+    posts++;
+    for (const { session, events } of included) {
+      advanceLedger(ledger, source, session.sessionId, events);
+    }
+    removeInFlight(ledger, source, batchId);
+    addPendingComplete(ledger, source, { startDate: date, endDate: date });
+    saveLedger(ledger, env);
+  };
+  const bySession = new Map(sessions.map((s) => [s.sessionId, s]));
+  const resent = /* @__PURE__ */ new Set();
+  for (const inflight of [...ledger.inFlight[source]]) {
+    const included = [];
+    for (const r of inflight.records) {
+      const session = bySession.get(r.sessionId);
+      if (!session) continue;
+      const wanted = new Set(r.recordIds);
+      const events = session.events.filter((e) => wanted.has(e.recordId));
+      if (events.length > 0) included.push({ session, events });
+    }
+    if (included.length === 0) {
+      removeInFlight(ledger, source, inflight.batchId);
+      saveLedger(ledger, env);
+      continue;
+    }
+    const [chunk] = splitIntoPayloads(included, Number.POSITIVE_INFINITY);
+    await postChunk(inflight.date, inflight.batchId, included, chunk.payload);
+    for (const { session, events } of included) {
+      for (const e of events)
+        resent.add(eventKey(session.sessionId, e.recordId));
+    }
+    log(
+      `  ${source} ${inflight.date}: \u524D\u56DE\u5FDC\u7B54\u3092\u78BA\u8A8D\u3067\u304D\u306A\u304B\u3063\u305F 1 \u901A\u3092\u518D\u9001\u3057\u307E\u3057\u305F`
+    );
+  }
+  const remaining = sessions.map((s) => ({
+    ...s,
+    events: s.events.filter(
+      (e) => !resent.has(eventKey(s.sessionId, e.recordId))
+    )
+  })).filter((s) => s.events.length > 0);
+  const grouped = groupByUtcDate(remaining);
   for (const [date, batches] of grouped) {
     const chunks = splitIntoPayloads(batches);
     for (const { payload, included, batchId } of chunks) {
-      await sender.postLogs(source, date, batchId, payload);
-      posts++;
-      for (const { session, events } of included) {
-        advanceLedger(ledger, source, session.sessionId, events);
-      }
-      addPendingComplete(ledger, source, { startDate: date, endDate: date });
-      saveLedger(ledger, env);
+      await postChunk(date, batchId, included, payload);
     }
     log(
       `  ${source} ${date}: ${batches.length} sessions, ${chunks.length} request(s)`
     );
   }
   const eventCount = sessions.reduce((n, s) => n + s.events.length, 0);
-  for (const range of coalesceDateRanges(ledger.pendingComplete[source])) {
-    const workflowId = await sender.complete({
-      source,
-      startDate: range.startDate,
-      endDate: range.endDate,
-      sessionCount: sessions.length,
-      eventCount
-    });
-    removePendingCompleteWithin(ledger, source, range);
-    saveLedger(ledger, env);
-    log(
-      `  ${source}: \u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})${workflowId ? ` workflow=${workflowId}` : ""}`
-    );
-  }
+  await completePendingWindows(
+    ledger,
+    source,
+    { sessionCount: sessions.length, eventCount },
+    sender,
+    log,
+    env
+  );
   return { dates: grouped.length, posts };
 }
 async function flushPendingCompletes(ledger, sources, sender, log, env = process.env) {
   let flushed = 0;
   for (const source of sources) {
-    for (const range of coalesceDateRanges(ledger.pendingComplete[source])) {
-      const workflowId = await sender.complete({
-        source,
-        startDate: range.startDate,
-        endDate: range.endDate,
-        sessionCount: 0,
-        eventCount: 0
-      });
-      removePendingCompleteWithin(ledger, source, range);
-      saveLedger(ledger, env);
-      flushed++;
-      log(
-        `  ${source}: \u524D\u56DE\u672A\u7533\u544A\u306E\u518D\u96C6\u8A08\u3092\u4F9D\u983C\u3057\u307E\u3057\u305F (${range.startDate} .. ${range.endDate})${workflowId ? ` workflow=${workflowId}` : ""}`
-      );
-    }
+    flushed += await completePendingWindows(
+      ledger,
+      source,
+      { sessionCount: 0, eventCount: 0 },
+      sender,
+      log,
+      env,
+      "\u524D\u56DE\u672A\u7533\u544A\u306E"
+    );
   }
   return flushed;
 }
